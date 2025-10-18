@@ -1,7 +1,10 @@
 import json
 import requests
 from uuid import uuid4
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import asyncio
+from typing import Dict, List, Optional, Any
+from contextlib import AsyncExitStack
 
 from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
@@ -11,6 +14,9 @@ from uagents_core.contrib.protocols.chat import (
     StartSessionContent,
 )
 from uagents import Agent, Context, Protocol
+
+import mcp
+from mcp.client.streamable_http import streamablehttp_client
 
 import os
 from dotenv import load_dotenv
@@ -24,6 +30,170 @@ ASI1_HEADERS = {
     "Content-Type": "application/json",
 }
 
+class MarinadeFinanceMCPClient:
+    def __init__(self):
+        self.session: Optional[mcp.ClientSession] = None
+        self.exit_stack = AsyncExitStack()
+        self.all_tools = []
+        self.default_timeout = timedelta(seconds=30)
+        self.server_url = "https://docs.marinade.finance/~gitbook/mcp"
+
+    async def connect_to_server(self, ctx: Context):
+        """Connect to the Marinade Finance MCP server and collect its tools"""
+        try:
+            ctx.logger.info(f"Connecting to Marinade Finance MCP server: {self.server_url}")
+            
+            read_stream, write_stream, _ = await self.exit_stack.enter_async_context(
+                streamablehttp_client(self.server_url)
+            )
+            
+            self.session = await self.exit_stack.enter_async_context(
+                mcp.ClientSession(read_stream, write_stream)
+            )
+
+            await self.session.initialize()
+            tools_result = await self.session.list_tools()
+            self.all_tools = tools_result.tools
+
+            ctx.logger.info(f"Successfully connected to Marinade Finance MCP server")
+            ctx.logger.info(f"Available tools: {', '.join([t.name for t in self.all_tools])}")
+
+        except Exception as e:
+            ctx.logger.error(f"Error connecting to Marinade Finance MCP server: {str(e)}")
+            raise
+
+    async def process_query_with_mcp(self, query: str, ctx: Context) -> str:
+        """Process query using MCP tools when available, otherwise fallback to ASI1 API"""
+        try:
+            if self.session and self.all_tools:
+                tool = self.all_tools[0] 
+                
+                try:
+                    ctx.logger.info(f"Using MCP tool: {tool.name}")
+                    result = await asyncio.wait_for(
+                        self.session.call_tool(tool.name, {"query": query}),
+                        timeout=self.default_timeout.total_seconds()
+                    )
+                    
+                    mcp_context = self._format_mcp_context(result.content)
+                    return await self.process_query_with_context(query, mcp_context, ctx)
+                        
+                except asyncio.TimeoutError:
+                    ctx.logger.warning("MCP server timeout, falling back to ASI1 API")
+                except Exception as e:
+                    ctx.logger.warning(f"MCP tool error: {str(e)}, falling back to ASI1 API")
+            
+            return await self.process_query_with_asi1(query, ctx)
+            
+        except Exception as e:
+            ctx.logger.error(f"Error in process_query_with_mcp: {str(e)}")
+            return f"An error occurred: {str(e)}"
+
+    def _format_mcp_context(self, content) -> str:
+        """Format MCP response content as context for the LLM"""
+        try:
+            if isinstance(content, str):
+                return content
+            elif isinstance(content, list):
+                context_items = []
+                for item in content:
+                    if hasattr(item, 'text') and hasattr(item, 'type'):
+                        text_content = item.text
+                        context_items.append(text_content)
+                    else:
+                        context_items.append(str(item))
+                
+                return "\n\n".join(context_items)
+            else:
+                return str(content)
+        except Exception as e:
+            if isinstance(content, list):
+                return "\n".join([str(item) for item in content])
+            else:
+                return str(content)
+
+    async def process_query_with_context(self, query: str, context: str, ctx: Context) -> str:
+        """Process query using ASI1 API with MCP context"""
+        try:
+            user_message = {"role": "user", "content": query}
+            system_message = {
+                "role": "system",
+                "content": (
+                    "You are a helpful assistant specialized in answering questions about Marinade Finance. "
+                    "Marinade Finance is a liquid staking protocol on Solana that allows users to stake SOL "
+                    "and receive mSOL tokens in return, maintaining liquidity while earning staking rewards.\n\n"
+                    "Use the following context from Marinade Finance documentation to provide accurate and helpful answers. "
+                    "Format your response in a clear, conversational way that's easy for users to understand:\n\n"
+                    f"CONTEXT:\n{context}\n\n"
+                    "Based on this context, provide a comprehensive answer to the user's question. "
+                    "If the context doesn't contain enough information to fully answer the question, "
+                    "you can supplement with your general knowledge about Marinade Finance, but prioritize the provided context."
+                ),
+            }
+
+            payload = {
+                "model": "asi1-mini",
+                "messages": [system_message, user_message],
+                "temperature": 0.2,
+                "max_tokens": 4096,
+            }
+
+            resp = requests.post(
+                f"{ASI1_BASE_URL}/chat/completions",
+                headers=ASI1_HEADERS,
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            response_json = resp.json()
+            model_msg = response_json["choices"][0]["message"]
+
+            return model_msg["content"]
+
+        except Exception as e:
+            ctx.logger.error(f"Error processing query with context: {e}")
+            return f"An error occurred: {e}"
+
+    async def process_query_with_asi1(self, query: str, ctx: Context) -> str:
+        """Process query using ASI1 API as fallback"""
+        try:
+            user_message = {"role": "user", "content": query}
+            system_message = {
+                "role": "system",
+                "content": (
+                    "You are a helpful assistant specialized in answering questions about Marinade Finance. "
+                    "Marinade Finance is a liquid staking protocol on Solana that allows users to stake SOL "
+                    "and receive mSOL tokens in return, maintaining liquidity while earning staking rewards."
+                ),
+            }
+
+            payload = {
+                "model": "asi1-mini",
+                "messages": [system_message, user_message],
+                "temperature": 0.2,
+                "max_tokens": 4096,
+            }
+
+            resp = requests.post(
+                f"{ASI1_BASE_URL}/chat/completions",
+                headers=ASI1_HEADERS,
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            response_json = resp.json()
+            model_msg = response_json["choices"][0]["message"]
+
+            return model_msg["content"]
+
+        except Exception as e:
+            ctx.logger.error(f"Error processing query with ASI1: {e}")
+            return f"An error occurred: {e}"
+
+    async def cleanup(self):
+        """Clean up resources"""
+        await self.exit_stack.aclose()
+
 def _text_msg(text: str) -> ChatMessage:
     return ChatMessage(
         timestamp=datetime.now(timezone.utc),
@@ -31,49 +201,16 @@ def _text_msg(text: str) -> ChatMessage:
         content=[TextContent(type="text", text=text)],
     )
 
-async def process_query(query: str, ctx: Context):
-    try:
-        user_message = {"role": "user", "content": query}
-        system_message = {
-            "role": "system",
-            "content": (
-                "You are a helpful assistant specialized in answering questions about Marinade Finance."
-            ),
-        }
-
-        payload = {
-            "model": "asi1-mini",
-            "messages": [system_message, user_message],
-            "temperature": 0.2,
-            "max_tokens": 4096,
-        }
-
-        resp = requests.post(
-            f"{ASI1_BASE_URL}/chat/completions",
-            headers=ASI1_HEADERS,
-            json=payload,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        response_json = resp.json()
-        model_msg = response_json["choices"][0]["message"]
-
-        return model_msg["content"]
-
-    except Exception as e:
-        ctx.logger.error(f"Error processing query: {e}")
-        return f"An error occurred: {e}"
-
 
 agent = Agent(name="marinade-finance-agent", port=8001, mailbox=True)
 chat_proto = Protocol(spec=chat_protocol_spec)
+mcp_client = MarinadeFinanceMCPClient()
 
 
 @agent.on_event("startup")
 async def _startup(ctx: Context):
-    ctx.logger.info(
-        f"🚀 Starting"
-    )
+    ctx.logger.info("🚀 Starting Marinade Finance Agent")
+
 
 @chat_proto.on_message(model=ChatMessage)
 async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
@@ -83,13 +220,19 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
         )
         await ctx.send(sender, ack)
 
+        if not mcp_client.session:
+            try:
+                await mcp_client.connect_to_server(ctx)
+            except Exception as e:
+                ctx.logger.warning(f"Failed to connect to MCP server: {e}, will use ASI1 API only")
+
         for item in msg.content:
             if isinstance(item, StartSessionContent):
                 ctx.logger.info(f"Got a start session message from {sender}")
                 continue
             elif isinstance(item, TextContent):
                 ctx.logger.info(f"Got a message from {sender}: {item.text}")
-                result = await process_query(item.text, ctx)
+                result = await mcp_client.process_query_with_mcp(item.text, ctx)
 
                 response_text = (
                     result if isinstance(result, str) else json.dumps(result)
@@ -116,4 +259,9 @@ async def handle_chat_acknowledgement(
 agent.include(chat_proto)
 
 if __name__ == "__main__":
-    agent.run()
+    try:
+        agent.run()
+    except Exception as e:
+        print(f"Error running agent: {str(e)}")
+    finally:
+        asyncio.run(mcp_client.cleanup())
