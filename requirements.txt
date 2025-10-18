@@ -1,0 +1,6 @@
+requests
+python-dotenv
+uagents
+uagents-core
+dotenv
+mcp
