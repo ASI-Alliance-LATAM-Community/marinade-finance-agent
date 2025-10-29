@@ -3,7 +3,7 @@ import requests
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 import asyncio
-from typing import Dict, List, Optional, Any
+from typing import Optional
 from contextlib import AsyncExitStack
 
 from uagents_core.contrib.protocols.chat import (
@@ -25,10 +25,15 @@ load_dotenv()
 
 ASI1_API_KEY = os.getenv("ASI1_API_KEY")
 ASI1_BASE_URL = "https://api.asi1.ai/v1"
+
+SMITHERY_API_KEY = os.getenv("SMITHERY_API_KEY")
+SMITHERY_PROFILE = os.getenv("SMITHERY_PROFILE")
+
 ASI1_HEADERS = {
     "Authorization": f"Bearer {ASI1_API_KEY}" if ASI1_API_KEY else "",
     "Content-Type": "application/json",
 }
+
 
 class MarinadeFinanceMCPClient:
     def __init__(self):
@@ -36,17 +41,19 @@ class MarinadeFinanceMCPClient:
         self.exit_stack = AsyncExitStack()
         self.all_tools = []
         self.default_timeout = timedelta(seconds=30)
-        self.server_url = "https://docs.marinade.finance/~gitbook/mcp"
+        self.server_url = f"https://server.smithery.ai/@leandrogavidia/marinade-finance-mcp-server/mcp?api_key={SMITHERY_API_KEY}&profile={SMITHERY_PROFILE}"
 
     async def connect_to_server(self, ctx: Context):
         """Connect to the Marinade Finance MCP server and collect its tools"""
         try:
-            ctx.logger.info(f"Connecting to Marinade Finance MCP server: {self.server_url}")
-            
+            ctx.logger.info(
+                f"Connecting to Marinade Finance MCP server: {self.server_url}"
+            )
+
             read_stream, write_stream, _ = await self.exit_stack.enter_async_context(
                 streamablehttp_client(self.server_url)
             )
-            
+
             self.session = await self.exit_stack.enter_async_context(
                 mcp.ClientSession(read_stream, write_stream)
             )
@@ -56,38 +63,136 @@ class MarinadeFinanceMCPClient:
             self.all_tools = tools_result.tools
 
             ctx.logger.info(f"Successfully connected to Marinade Finance MCP server")
-            ctx.logger.info(f"Available tools: {', '.join([t.name for t in self.all_tools])}")
+            ctx.logger.info(
+                f"Available tools: {', '.join([t.name for t in self.all_tools])}"
+            )
 
         except Exception as e:
-            ctx.logger.error(f"Error connecting to Marinade Finance MCP server: {str(e)}")
+            ctx.logger.error(
+                f"Error connecting to Marinade Finance MCP server: {str(e)}"
+            )
             raise
 
     async def process_query_with_mcp(self, query: str, ctx: Context) -> str:
         """Process query using MCP tools when available, otherwise fallback to ASI1 API"""
         try:
             if self.session and self.all_tools:
-                tool = self.all_tools[0] 
-                
-                try:
-                    ctx.logger.info(f"Using MCP tool: {tool.name}")
-                    result = await asyncio.wait_for(
-                        self.session.call_tool(tool.name, {"query": query}),
-                        timeout=self.default_timeout.total_seconds()
-                    )
-                    
-                    mcp_context = self._format_mcp_context(result.content)
-                    return await self.process_query_with_context(query, mcp_context, ctx)
-                        
-                except asyncio.TimeoutError:
-                    ctx.logger.warning("MCP server timeout, falling back to ASI1 API")
-                except Exception as e:
-                    ctx.logger.warning(f"MCP tool error: {str(e)}, falling back to ASI1 API")
-            
+
+                selected_tool = self._select_appropriate_tool(query, ctx)
+
+                if selected_tool:
+                    try:
+                        ctx.logger.info(f"Using MCP tool: {selected_tool.name}")
+
+                        params = self._prepare_tool_parameters(
+                            selected_tool.name, query
+                        )
+
+                        result = await asyncio.wait_for(
+                            self.session.call_tool(selected_tool.name, params),
+                            timeout=self.default_timeout.total_seconds(),
+                        )
+
+                        mcp_context = self._format_mcp_context(result.content)
+                        return await self.process_query_with_context(
+                            query, mcp_context, ctx
+                        )
+
+                    except asyncio.TimeoutError:
+                        ctx.logger.warning(
+                            "MCP server timeout, falling back to ASI1 API"
+                        )
+                    except Exception as e:
+                        ctx.logger.warning(
+                            f"MCP tool error: {str(e)}, falling back to ASI1 API"
+                        )
+
             return await self.process_query_with_asi1(query, ctx)
-            
+
         except Exception as e:
             ctx.logger.error(f"Error in process_query_with_mcp: {str(e)}")
             return f"An error occurred: {str(e)}"
+
+    def _select_appropriate_tool(self, query: str, ctx: Context):
+        """Select the most appropriate MCP tool based on the query content"""
+        if not self.all_tools:
+            return None
+
+        query_lower = query.lower()
+
+        state_keywords = [
+            "price",
+            "current",
+            "state",
+            "balance",
+            "amount",
+            "value",
+            "rewards",
+            "rate",
+            "apy",
+            "apr",
+            "stake",
+            "unstake",
+            "msol",
+            "how much",
+            "what is the",
+            "current price",
+            "latest",
+        ]
+
+        doc_keywords = [
+            "how to",
+            "guide",
+            "tutorial",
+            "documentation",
+            "docs",
+            "api",
+            "sdk",
+            "integration",
+            "example",
+            "code",
+            "implement",
+            "explain",
+            "what is",
+            "how does",
+            "feature",
+            "function",
+        ]
+
+        if any(keyword in query_lower for keyword in state_keywords):
+            for tool in self.all_tools:
+                if tool.name == "get_marinade_state":
+                    ctx.logger.info(
+                        f"Selected get_marinade_state for query: {query[:50]}..."
+                    )
+                    return tool
+
+        if any(keyword in query_lower for keyword in doc_keywords):
+            for tool in self.all_tools:
+                if tool.name == "search_documentation":
+                    ctx.logger.info(
+                        f"Selected search_documentation for query: {query[:50]}..."
+                    )
+                    return tool
+
+        for tool in self.all_tools:
+            if tool.name == "search_documentation":
+                ctx.logger.info(
+                    f"Default to search_documentation for query: {query[:50]}..."
+                )
+                return tool
+
+        return self.all_tools[0] if self.all_tools else None
+
+    def _prepare_tool_parameters(self, tool_name: str, query: str) -> dict:
+        """Prepare parameters for the selected MCP tool"""
+        if tool_name == "search_documentation":
+            return {"query": query}
+        elif tool_name == "get_marinade_state":
+            return {}
+        else:
+
+            return {"query": query}
 
     def _format_mcp_context(self, content) -> str:
         """Format MCP response content as context for the LLM"""
@@ -97,12 +202,12 @@ class MarinadeFinanceMCPClient:
             elif isinstance(content, list):
                 context_items = []
                 for item in content:
-                    if hasattr(item, 'text') and hasattr(item, 'type'):
+                    if hasattr(item, "text") and hasattr(item, "type"):
                         text_content = item.text
                         context_items.append(text_content)
                     else:
                         context_items.append(str(item))
-                
+
                 return "\n\n".join(context_items)
             else:
                 return str(content)
@@ -112,7 +217,9 @@ class MarinadeFinanceMCPClient:
             else:
                 return str(content)
 
-    async def process_query_with_context(self, query: str, context: str, ctx: Context) -> str:
+    async def process_query_with_context(
+        self, query: str, context: str, ctx: Context
+    ) -> str:
         """Process query using ASI1 API with MCP context"""
         try:
             user_message = {"role": "user", "content": query}
@@ -194,6 +301,7 @@ class MarinadeFinanceMCPClient:
         """Clean up resources"""
         await self.exit_stack.aclose()
 
+
 def _text_msg(text: str) -> ChatMessage:
     return ChatMessage(
         timestamp=datetime.now(timezone.utc),
@@ -224,7 +332,9 @@ async def handle_chat_message(ctx: Context, sender: str, msg: ChatMessage):
             try:
                 await mcp_client.connect_to_server(ctx)
             except Exception as e:
-                ctx.logger.warning(f"Failed to connect to MCP server: {e}, will use ASI1 API only")
+                ctx.logger.warning(
+                    f"Failed to connect to MCP server: {e}, will use ASI1 API only"
+                )
 
         for item in msg.content:
             if isinstance(item, StartSessionContent):
